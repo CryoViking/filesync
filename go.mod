@@ -1,4 +1,4 @@
-module CryoViking/filesync
+module github.com/CryoViking/filesync
 
 go 1.22.2
 
