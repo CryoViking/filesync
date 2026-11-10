@@ -1,158 +1,21 @@
 package main
 
 import (
-	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
 
-	"github.com/fsnotify/fsnotify"
 	"github.com/mgutz/ansi"
 	"github.com/urfave/cli/v2"
 )
 
 var DEBUG bool = false
 
-type Options struct {
-	SyncedFolderDest string
-	ServerAddress    string
-	RootPath         string
-}
-
-func trim_root_folder(o *Options, filepath string) string {
-	remaining_path := strings.TrimPrefix(filepath, o.RootPath)
-
-	// Ensure that it starts with a '/'
-	if !strings.HasPrefix(remaining_path, "/") {
-		remaining_path = "/" + remaining_path
-	}
-	return remaining_path
-}
-
-func sync_files(o *Options, filepath string) {
-	// Construct the rsync command
-	file_dest := o.SyncedFolderDest + trim_root_folder(o, filepath)
-	rsync_cmd := exec.Command(
-		"rsync",
-		"-avz",
-		".",
-		fmt.Sprintf("%s:%s", o.ServerAddress, o.SyncedFolderDest),
-		"--include=**.gitignore",
-		"--exclude=/.git",
-		"--filter=:- .gitignore",
-		"--delete-after",
-	)
-
-	// Print the curated output.
-	log.Printf("%sSyncing%s: %s to location: %s:%s\n",
-		ansi.Cyan,
-		ansi.DefaultFG,
-		filepath,
-		o.ServerAddress,
-		file_dest,
-	)
-
-	// Run the command and capture any errors
-	output, err := rsync_cmd.CombinedOutput()
-	if err != nil {
-		log.Printf("%sERROR%s: %v, output: %s",
-			ansi.Red,
-			ansi.DefaultFG,
-			err,
-			output,
-		)
-	} else {
-		log.Printf("%sSynced%s: %s\n",
-			ansi.Green,
-			ansi.DefaultFG,
-			filepath,
-		)
-		if DEBUG {
-			log.Printf("%sRSYNC%s: %s",
-				ansi.Cyan,
-				ansi.DefaultFG,
-				output,
-			)
-		}
-	}
-}
-
-func file_watcher(o *Options) {
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer watcher.Close()
-
-	done := make(chan bool)
-	defer close(done)
-
-	absPath, err := filepath.Abs(".")
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// Add all subdirectories to the watcher
-	err = filepath.Walk(absPath, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		// Watch directories only
-		if info.IsDir() {
-			if err := watcher.Add(path); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// Start a goroutine to watch for events
-	go func() {
-		for {
-			select {
-			case event := <-watcher.Events:
-				abs_name_path, err := filepath.Abs(event.Name)
-				if err != nil {
-					log.Println(err)
-					continue
-				}
-				// Don't do anything if the file is a temp nvim file
-				if abs_name_path[len(abs_name_path)-1:] == "~" {
-					continue
-				}
-				// Sync on Create, Write, Rename, or Remove events
-				if event.Op&fsnotify.Create == fsnotify.Create || event.Op&fsnotify.Write == fsnotify.Write ||
-					event.Op&fsnotify.Rename == fsnotify.Rename || event.Op&fsnotify.Remove == fsnotify.Remove {
-					sync_files(o, abs_name_path)
-				}
-				// If a new directory is created, add it to the watcher
-				if event.Op&fsnotify.Create == fsnotify.Create {
-					info, err := os.Stat(abs_name_path)
-					if err == nil && info.IsDir() {
-						if err := watcher.Add(abs_name_path); err != nil {
-							log.Println("Failed to add directory:", abs_name_path, err)
-						}
-					}
-				}
-			case err := <-watcher.Errors:
-				log.Println("Error:", err)
-			}
-		}
-	}()
-
-	<-done
-}
-
 func main() {
 	app := &cli.App{
 		Name:      "filesync",
 		Usage:     "Sync the current folder to a destination folder on a remote machine when file changes occur",
-		UsageText: "filesync <dest_folder>",
+		UsageText: "filesync --ssh-address <host> <dest_folder>",
 		Action: func(c *cli.Context) error {
 			destFolder := c.Args().First()
 			if destFolder == "" {
@@ -165,19 +28,35 @@ func main() {
 			if err != nil {
 				log.Fatal(err)
 			}
+			if resolved, err := filepath.EvalSymlinks(root_dir); err == nil {
+				root_dir = resolved
+			}
 
 			options := Options{
 				SyncedFolderDest: destFolder,
 				ServerAddress:    c.String("ssh-address"),
 				RootPath:         root_dir,
 			}
+			// Git mode only from the top of a work tree: the file list is relative to it, and so is
+			// the destination.
+			if top := gitRoot(root_dir); top != "" {
+				if resolved, err := filepath.EvalSymlinks(top); err == nil && resolved == root_dir {
+					options.GitRoot = root_dir
+					options.Manifest = manifestPath(root_dir)
+				}
+			}
+			if options.GitRoot != "" {
+				log.Printf("%sMode%s: git source files (tracked, plus untracked files git doesn't ignore)\n", ansi.Cyan, ansi.DefaultFG)
+			} else {
+				log.Printf("%sMode%s: not the top of a git work tree; using .gitignore as an rsync filter\n", ansi.Yellow, ansi.DefaultFG)
+			}
 			// We set the verbosity of the program here.
 			// NOTE: Yes this is a global variable but I'm a smart programmer...
 			// why would I be setting it else where.
 			DEBUG = c.Bool("verbose")
 
-			go file_watcher(&options)
-			select {} // Keep the main function running
+			watch(&options, newSyncer(&options), c.Duration("quiet"))
+			return nil
 		},
 		Flags: []cli.Flag{
 			&cli.StringFlag{
@@ -191,6 +70,11 @@ func main() {
 				Value:    false,
 				Required: false,
 				Usage:    "Set the verbosity of the program, if enabled rsync output will also be printed.",
+			},
+			&cli.DurationFlag{
+				Name:  "quiet",
+				Value: 300_000_000, // 300ms
+				Usage: "How long files must stay unchanged before a sync starts, so one save is one sync.",
 			},
 		},
 	}
