@@ -8,11 +8,25 @@ and destination machines.
 
 **DISCLAIMER:** This tool is first and foremost a tool for my own workflow. There are countless improvements that could be added but if it doesn't affect my workflow chances are I won't spend the time to add requested features.
 
-Due to the nature of the tool being for my own work flow, the underlying `rsync` command
-looks like the following
+Run from the top of a git work tree, it syncs exactly the files git considers source:
+tracked files, plus untracked files git doesn't ignore. Git is asked for that list
+(`git ls-files --cached --others --exclude-standard`), so negations, nested `.gitignore`
+files and global excludes all behave as they do in git.
+```bash
+git ls-files -z --cached --others --exclude-standard | rsync -az -0 --files-from=- . {server}:{folder_dest}
+```
+Nothing outside that list is ever written or deleted on the remote, so build output there
+(`bin/`, `obj/`, `publish/`, whoever owns it) is left alone. A file that was synced before
+and is gone now is deleted remotely over `ssh`. The last synced list is kept in
+`.git/filesync-manifest`, so files deleted while filesync wasn't running are deleted at the
+next start.
+
+Changes are gathered until files have been quiet for a moment (`--quiet`, 300ms by
+default), so one save is one sync, and it syncs once at start.
+
+Outside a git work tree it falls back to the original behaviour:
 ```bash
 rsync -avz . {server}:{folder_dest} --include=**.gitignore --exclude=/.git --filter=:- .gitignore --delete-after
-
 ```
 ## Table of Contents
 - [Installation](#installation)
@@ -75,6 +89,8 @@ This project is licensed under the MIT License - see the [LICENSE](https://githu
 A brief description of the features of this project.
 
 - Utilises `rsync` under the hood to transfer the files.
+- Follows git's own idea of what the source files are, negations included.
+- Never touches build output on the remote.
 - Simple CLI usage.
 
 ## <a name="roadmap"></a>Roadmap (IDK)
